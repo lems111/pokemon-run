@@ -1,0 +1,39 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Stable-Baselines3 & PyBoy related
+# TensorBoard logs
+runs/
+tensorboard/
+
+# Saved models (checkpoints)
+models/
+*.zip
+*.pth
+
+# PyBoy specific (if saving game states/screenshots)
+.sav
+.png
+
+# Common IDE/Editor files
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Data & Large Files
+# Add specific large ROMs or datasets here if needed, e.g.,
+# data/
+roms/
+
+# OS generated files
+.DS_Store
+Thumbs.db

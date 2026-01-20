@@ -1,0 +1,11 @@
+gym
+stable-baselines3[extra]
+torch
+pygame
+pillow
+requests
+aiohttp
+numpy
+pyboy
+aiohttp
+python-dotenv
