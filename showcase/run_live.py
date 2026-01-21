@@ -5,14 +5,13 @@ Runs the game in a visible window with real-time model loading.
 import os
 import sys
 import time
+from dotenv import load_dotenv
 import pygame
+import requests
 import numpy as np
 from PIL import Image
 import threading
 from queue import Queue
-import json
-import requests
-from dotenv import load_dotenv
 
 # Add project root directory to Python path to find pokemon_yellow_env
 project_root = os.path.dirname(os.path.abspath(__file__)) + "/.."
@@ -20,12 +19,18 @@ sys.path.append(project_root)
 
 from pokemon_yellow_env import PokemonYellowEnv
 from memory_map import (
-    decode_player_position, decode_badge_count, decode_party_stats, get_observation_vector,
-    pretty_print_battle, type_id_to_name, move_id_to_name, parse_player_name
+    decode_basic_game_info, decode_money,
+    pretty_print_battle, type_id_to_name, move_id_to_name
 )
 from actions import ActionHandler
-from rewards import PhaseRewardShaper
 
+# Map id -> name (overlay location)
+try:
+    from memory.map_names import map_name as _map_name
+except Exception:
+    def _map_name(map_id):
+        return "Unknown"
+    
 class ShowcaseRunner:
     """
     Live showcase runner for Pokémon Yellow RL agent.
@@ -36,7 +41,7 @@ class ShowcaseRunner:
                  save_state_path: str = "states/pallet_town.state",
                  window_size: tuple = (1200, 1000),
                  fps: int = 60):
-        
+        load_dotenv()
         self.model_path = model_path
         self.save_state_path = save_state_path
         self.window_size = window_size
@@ -44,7 +49,6 @@ class ShowcaseRunner:
         
         # Initialize components
         self.env = PokemonYellowEnv()
-        self.reward_shaper = PhaseRewardShaper()
         
         # Emulator state
         self.running = False
@@ -145,41 +149,54 @@ class ShowcaseRunner:
         """Run a single episode."""
         # Reset environment
         obs, info = self.env.reset()
+        # Reset per-episode counters
+        self.episode_steps = 0
+        self.total_reward = 0.0
         done = False
         total_reward = 0
-        
+
         print("Starting showcase episode...")
-        
+
         while not done and self.running:
             # Hot-swap model if needed
             self.hot_swap_model()
-            
+
             # Get action from model
             action = self.get_action(obs)
-            
+
             # Execute action
             obs, reward, done, _, info = self.env.step(action)
             total_reward += reward
-            
-            # Update stats
+
+            # Update stats from env info
             self.episode_steps += 1
+            self.total_reward = float(total_reward)
             if 'tiles_visited' in info:
-                self.tiles_visited = info['tiles_visited']
-            if 'reward' in info:
-                self.total_reward += info['reward']
-                
+                self.tiles_visited = int(info['tiles_visited'])
+            # Pull battle stats from the reward shaper if present
+            try:
+                rs = getattr(self.env, 'reward_shaper', None)
+                if rs is not None:
+                    self.battles_won = int(getattr(rs, 'previous_battle_wins', 0))
+                    self.battles_lost = int(getattr(rs, 'previous_battle_losses', 0))
+            except Exception:
+                pass
+            # Badges can be read from info if the env provides it
+            if 'badges' in info:
+                self.badges_earned = int(info['badges'])
+
             # Render display
             self.render_display()
-            
+
             # Control frame rate
             self.clock.tick(self.fps)
-            
+
             # Check for quit
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
                     done = True
-                    
+
         print(f"Episode finished. Total reward: {total_reward}")
         
     def get_action(self, obs):
@@ -198,45 +215,71 @@ class ShowcaseRunner:
     def render_display(self):
         """Render the current game state and stats."""
         self.screen.fill((0, 0, 0))  # Black background
-        
+
         # Draw stats
         stats_text = [
             f"Steps: {self.episode_steps}",
             f"Tiles Visited: {self.tiles_visited}",
+            f"Battles Won: {self.battles_won}",
+            f"Battles Lost: {self.battles_lost}",
+            f"Badges: {self.badges_earned}",
             f"Total Reward: {self.total_reward:.2f}",
-            f"Model: {os.path.basename(self.current_model) if self.current_model else 'None'}"
+            f"Model: {os.path.basename(self.current_model) if self.current_model else 'None'}",
         ]
-        
+
         for i, text in enumerate(stats_text):
             text_surface = self.font.render(text, True, (255, 255, 255))
             self.screen.blit(text_surface, (10, 10 + i * 40))
-            
-        # Draw position
-        try:
-            # Decode position from RAM
-            ram_data = self.env._get_observation()
-            position = decode_player_position(ram_data)
-            pos_text = f"Position: ({position[1]}, {position[2]}) on map {position[0]}"
-            pos_surface = self.font.render(pos_text, True, (255, 255, 255))
-            self.screen.blit(pos_surface, (10, 200))
-        except Exception as e:
-            pos_text = f"Position: Error reading ({str(e)})"
-            pos_surface = self.font.render(pos_text, True, (255, 255, 255))
-            self.screen.blit(pos_surface, (10, 200))
 
-            # Battle inspector overlay (shows a compact summary when in battle)
-            try:
-                batt = pretty_print_battle(ram_data)
+        # Read WRAM bytes for decoders
+        try:
+            if hasattr(self.env, '_get_wram_d000'):
+                ram = self.env._get_wram_d000()
+            else:
+                ram = None
+        except Exception:
+            ram = None
+
+       # Draw position + basic state (single source of truth)
+        map_id = 0
+        x = 0
+        y = 0
+        in_battle = False
+        money = 0
+        try:
+            if ram is not None:
+                basic = decode_basic_game_info(ram)
+                map_id = int(basic.get("map_id", 0))
+                x = int(basic.get("x", 0))
+                y = int(basic.get("y", 0))
+                in_battle = bool(basic.get("in_battle", False))
+                self.badges_earned = int(basic.get("badges", 0))
+                money = int(basic.get("money", 0))
+        except Exception:
+            pass
+
+        pos_text = f"Position: ({x}, {y}) on {_map_name(map_id)} (0x{map_id:02X})"
+        status_text = "Status: In Battle" if in_battle else "Status: Exploring"
+        self.screen.blit(self.font.render(pos_text, True, (255, 255, 255)), (10, 240))
+        self.screen.blit(self.font.render(status_text, True, (255, 255, 255)), (10, 280))
+        self.screen.blit(self.font.render(f"Money: {money}", True, (255, 255, 255)), (10, 320))
+
+        # Battle inspector overlay (shows a compact summary when in battle)
+        try:
+            if ram is not None:
+                batt = pretty_print_battle(ram)
                 if batt.get('in_battle'):
-                    y0 = 260
+                    y0 = 380
                     header = f"In Battle (type {batt.get('battle_type')})"
                     self.screen.blit(self.font.render(header, True, (255, 200, 0)), (10, y0))
                     y0 += 36
+
                     # Show party HP summary
                     for p in batt.get('party', []):
                         p_line = f"P[{p['index']}] HP: {p['current_hp']}/{p['max_hp']}"
                         self.screen.blit(self.font.render(p_line, True, (200, 200, 200)), (10, y0))
                         y0 += 24
+
                     # Show up to 4 opponents
                     for opp in batt.get('opponents', [])[:4]:
                         typ = type_id_to_name(opp.get('type1')) if opp.get('type1') is not None else ''
@@ -244,121 +287,52 @@ class ShowcaseRunner:
                         line = f"Opp #{opp.get('id')} L{opp.get('level')} HP:{opp.get('current_hp')}/{opp.get('max_hp')} Type:{typ} Moves:{moves}"
                         self.screen.blit(self.font.render(line, True, (255, 255, 255)), (10, y0))
                         y0 += 24
-            except Exception:
-                # Non-fatal: inspector shouldn't crash the showcase
-                pass
-
-        # Send periodic overlay updates (non-blocking)
-        now = time.time()
-        try:
-            # Build a small payload; tolerate missing data
-            payload = {
-                'stats': {
-                    'tiles_visited': self.tiles_visited,
-                    'episode_steps': self.episode_steps,
-                    'battles_won': self.battles_won,
-                    'battles_lost': self.battles_lost,
-                    'badges': self.badges_earned,
-                    'money': 0,  # We'll update this with actual money from RAM
-                    'total_reward': self.total_reward
-                },
-                'commentary': '',
-                'action_confidence': {
-                    'up': 0.0,
-                    'down': 0.0,
-                    'left': 0.0,
-                    'right': 0.0,
-                    'a': 0.0,
-                    'b': 0.0
-                }
-            }
-
-            # Try to include position, battle info, and money if available
-            try:
-                ram_data = self.env._get_observation()
-                position = decode_player_position(ram_data)
-                payload['game_state'] = {
-                    'location': 'unknown', 
-                    'x': position[1], 
-                    'y': position[2],
-                    'in_battle': False,
-                    'in_menu': False
-                }
-                batt = pretty_print_battle(ram_data)
-                payload['game_state']['in_battle'] = bool(batt.get('in_battle')) if batt else False
-                
-                # Get money from RAM
-                from memory_map import decode_money
-                money = decode_money(ram_data)
-                payload['stats']['money'] = money
-                
-            except Exception:
-                pass
-
-            if now - self._last_overlay_post >= self.post_interval:
-                self._send_overlay_update_async(payload)
-                self._last_overlay_post = now
         except Exception:
             pass
 
+        # Send periodic overlay updates (non-blocking)
+        now = time.time()
+        if now - self._last_overlay_post >= self.post_interval:
+            self._last_overlay_post = now
+
+            # Build payload with safe defaults
+            payload = {
+                'stats': {
+                    'tiles_visited': int(self.tiles_visited),
+                    'episode_steps': int(self.episode_steps),
+                    'battles_won': int(self.battles_won),
+                    'battles_lost': int(self.battles_lost),
+                    'badges': int(self.badges_earned),
+                    'money': int(money),
+                    'total_reward': float(self.total_reward),
+                },
+                'commentary': 'Showcase running' + (' (battle)' if in_battle else ''),
+                'game_state': {
+                    'map_id': int(map_id),
+                    'location': _map_name(int(map_id)),
+                    'x': int(x),
+                    'y': int(y),
+                    'in_battle': bool(in_battle),
+                    'in_menu': False,
+                },
+            }
+
+            # Action confidence (optional)
+            if self.send_action_data:
+                try:
+                    # Derive confidence from env action counts if available
+                    ac = {'up':0.0,'down':0.0,'left':0.0,'right':0.0,'a':0.0,'b':0.0}
+                    total = int(getattr(self.env, 'total_actions', 0) or 0)
+                    counts = getattr(self.env, 'action_counts', {}) or {}
+                    if total > 0:
+                        for k in ['UP','DOWN','LEFT','RIGHT','A','B']:
+                            kk = k.lower()
+                            if kk in ac:
+                                ac[kk] = float(counts.get(k, 0)) / float(total)
+                    payload['action_confidence'] = ac
+                except Exception:
+                    payload['action_confidence'] = {'up':0.0,'down':0.0,'left':0.0,'right':0.0,'a':0.0,'b':0.0}
+
+            self._send_overlay_update_async(payload)
+
         pygame.display.flip()
-        
-    def start(self):
-        """Start the showcase runner."""
-        print("Starting showcase runner...")
-        
-        # Initialize display
-        self.initialize_display()
-        
-        # Load initial model
-        if os.path.exists(self.model_path):
-            self.load_model(self.model_path)
-        else:
-            # Try to find latest checkpoint
-            latest_checkpoint = self.get_latest_checkpoint()
-            if latest_checkpoint:
-                self.load_model(latest_checkpoint)
-            else:
-                print("No model found, using default behavior")
-                # Create a simple test environment
-                print("Starting with random actions since no model found")
-                
-        self.running = True
-        
-        try:
-            # Run episodes
-            while self.running:
-                self.run_episode()
-                
-                # Reset for next episode
-                self.episode_steps = 0
-                self.tiles_visited = 0
-                self.total_reward = 0
-                
-        except KeyboardInterrupt:
-            print("Showcase interrupted by user")
-        finally:
-            self.cleanup()
-            
-    def cleanup(self):
-        """Clean up resources."""
-        self.running = False
-        pygame.quit()
-        print("Showcase runner stopped")
-
-def main():
-    """Main showcase function."""
-    load_dotenv()  # Load environment variables from .env file if present
-    # Create showcase runner
-    runner = ShowcaseRunner(
-        model_path="runs/checkpoints/latest.zip",
-        save_state_path="states/start_game.state",
-        window_size=(800, 600),
-        fps=60
-    )
-    
-    # Start showcase
-    runner.start()
-
-if __name__ == "__main__":
-    main()

@@ -67,21 +67,11 @@ class ActionHandler:
         return ACTION_COMBINATIONS.get(action_name, [action_name])
         
     def get_button_sequence(self, action_index: int) -> List[str]:
-        """
-        Get the proper button sequence for an action, handling combinations.
-        
-        Args:
-            action_index: Index of action (0-11)
-            
-        Returns:
-            List of button names to press in sequence
-        """
         action_name = ACTIONS[action_index]
-        
-        # Handle special combinations
+
         if action_name in ['UP_A', 'DOWN_A', 'LEFT_A', 'RIGHT_A']:
-            # For these actions, we want to press the direction first, then A
-            return [action_name[:3], 'A']  # e.g., ['UP', 'A']
+            direction = action_name.split('_', 1)[0]   # "UP_A" -> "UP"
+            return [direction, 'A']
         else:
             return [action_name]
     

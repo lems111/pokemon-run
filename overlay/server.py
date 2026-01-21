@@ -1,3 +1,18 @@
+def _deep_update(dst: dict, src: dict) -> dict:
+    """Recursively update dst with src. Ignores None values.
+
+    This prevents partial payloads from wiping nested dictionaries like 'stats' and 'game_state'.
+    """
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return dst
+    for k, v in src.items():
+        if v is None:
+            continue
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_update(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
 """
 Web server for Pokémon Yellow RL overlay in OBS.
 Serves HTML/CSS/JS overlay and provides a real WebSocket for live updates.
@@ -8,7 +23,6 @@ import os
 import threading
 import time
 from aiohttp import web, WSMsgType
-
 
 # Embedded HTML overlay (kept simple for the prototype)
 OVERLAY_HTML = """
@@ -46,7 +60,10 @@ OVERLAY_HTML = """
                 <div class="stat"><span>Battles Lost:</span> <span id="battles-lost">0</span></div>
                 <div class="stat"><span>Badges:</span> <span id="badges">0</span></div>
                 <div class="stat"><span>Money:</span> <span id="money">0</span></div>
-                <div class="stat"><span>Steps:</span> <span id="steps">0</span></div>
+                <div class="stat"><span>Episode Steps:</span> <span id="steps">0</span></div>
+                <div class="stat"><span>Global Steps:</span> <span id="global-steps">0</span></div>
+                <div class="stat"><span>Phase:</span> <span id="phase">-</span></div>
+                <div class="stat"><span>Phase Steps:</span> <span id="phase-steps">0</span></div>
             </div>
         </div>
         <div class="panel" style="grid-column: span 2;"><h2>Commentary</h2><div id="commentary" class="commentary">Welcome to Pokémon Yellow RL training!</div></div>
@@ -73,6 +90,9 @@ OVERLAY_HTML = """
             document.getElementById('badges').textContent = data.stats.badges||0;
             document.getElementById('money').textContent = data.stats.money||0;
             document.getElementById('steps').textContent = data.stats.episode_steps||0;
+            document.getElementById('global-steps').textContent = data.stats.global_steps||0;
+            document.getElementById('phase').textContent = (data.stats.phase === null || data.stats.phase === undefined) ? '-' : data.stats.phase;
+            document.getElementById('phase-steps').textContent = data.stats.phase_steps||0;
             document.getElementById('commentary').textContent = data.commentary||'';
             const updateConfidence = (k,v)=>{ const percent = Math.round((v||0)*100); const el = document.getElementById('conf-'+k); const fill = document.getElementById('conf-'+k+'-fill'); if(el && fill){ el.textContent = percent + '%'; fill.style.width = percent + '%'; }};
             ['up','down','left','right','a','b'].forEach(k=>updateConfidence(k, data.action_confidence?.[k]));
@@ -110,7 +130,7 @@ class OverlayServer:
 
         # Internal state
         self.overlay_data = {
-            'game_state': {'location': 'Pallet Town', 'x': 0, 'y': 0, 'in_battle': False, 'in_menu': False},
+            'game_state': {'map_id': 0, 'location': 'Pallet Town', 'x': 0, 'y': 0, 'in_battle': False, 'in_menu': False},
             'stats': {'tiles_visited': 0, 'battles_won': 0, 'battles_lost': 0, 'badges': 0, 'money': 0, 'episode_steps': 0},
             'commentary': 'Welcome to Pokémon Yellow RL training!',
             'action_confidence': {'up':0.0,'down':0.0,'left':0.0,'right':0.0,'a':0.0,'b':0.0},
@@ -191,9 +211,42 @@ class OverlayServer:
         """Background task that consumes the update queue and broadcasts updates."""
         while True:
             payload = await self._update_queue.get()
-            # merge payload into overlay_data
+            # merge payload into overlay_data using deep update
             try:
-                self.overlay_data.update(payload)
+                _deep_update(self.overlay_data, payload)
+
+                # Ensure required top-level keys always exist
+                self.overlay_data.setdefault('game_state', {})
+                self.overlay_data.setdefault('stats', {})
+                self.overlay_data.setdefault('action_confidence', {})
+                self.overlay_data.setdefault('commentary', '')
+
+                # Ensure required nested keys exist (so the overlay UI never breaks)
+                gs = self.overlay_data['game_state']
+                gs.setdefault('location', 'Unknown')
+                gs.setdefault('map_id', 0)
+                gs.setdefault('x', 0)
+                gs.setdefault('y', 0)
+                gs.setdefault('in_battle', False)
+                gs.setdefault('in_menu', False)
+
+                st = self.overlay_data['stats']
+                st.setdefault('tiles_visited', 0)
+                st.setdefault('battles_won', 0)
+                st.setdefault('battles_lost', 0)
+                st.setdefault('badges', 0)
+                st.setdefault('money', 0)
+                st.setdefault('episode_steps', 0)
+                # Newer optional stats (kept safe for both training + showcase payloads)
+                st.setdefault('global_steps', 0)
+                st.setdefault('phase', None)
+                st.setdefault('phase_steps', 0)
+                st.setdefault('total_reward', 0.0)
+
+                ac = self.overlay_data['action_confidence']
+                for k in ['up','down','left','right','a','b']:
+                    ac.setdefault(k, 0.0)
+
                 self.overlay_data['timestamp'] = time.time()
             except Exception as e:
                 print(f"An unexpected error occurred: {e}")

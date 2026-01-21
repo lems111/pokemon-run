@@ -1,13 +1,13 @@
 """
 Memory map constants and helper decoders for Pokémon Yellow.
 """
-import struct
 from typing import Optional
 
 # RAM Addresses - These are offsets relative to the WRAM window at 0xD000..0xDFFF (0x1000 bytes)
 # The memory_map constants are provided as offsets from 0xD000 (e.g. 0x35E -> absolute 0xD35E)
 # Values derived from the Pokémon R/B/Y RAM map (DataCrystal / pret disassembly)
 # Pokemon Yellow - Most of the RAM map (but not all) for this game has an offset of -1 from the one on Red and Blue.
+# Offsets below are already adjusted for Yellow where applicable
 RAM_ADDRESSES = {
     # Current map and player coordinates (relative to 0xD000)
     # D35E = Current map ID
@@ -17,38 +17,9 @@ RAM_ADDRESSES = {
     'PLAYER_MAP_Y': 0x360,   # absolute 0xD361
     'PLAYER_MAP_X': 0x361,   # absolute 0xD362
 
-    # Battle state
-    # D057 = Type of battle (0 when not in battle)
-    # D05A = Battle type (normal/safari/old man...)
-    'IN_BATTLE_FLAG': 0x056,  # absolute 0xD057
-    'BATTLE_TYPE': 0x059,     # absolute 0xD05A
-
-    # Party data (arrays of Pokémon data blocks)
-    # D163 = Party size (# Pokémon in party)
-    # D16C.. = current HP (2 bytes per mon), D18D.. = max HP (2 bytes per mon)
-    'PARTY_COUNT': 0x162,
-    'PARTY_CURRENT_HP': 0x16B,
-    'PARTY_MAX_HP': 0x18C,
-    'PARTY_BLOCK_SIZE': 0x2C,  # bytes between successive party entries
-
-    # Game progress
-    # D356 contains badges as binary switches (bits set = badge owned)
-    'BADGES': 0x355,
-    # D347-D349 = money bytes (little-endian 3-byte integer)
-    'MONEY': 0x346,
-
-    # Text/display-related (see notes) - D358/D359 are text-related flags/IDs
-    'TEXT_STATE': 0x357,
-    # Misc options (D355) - encodes battle animation, battle style, text speed nybble
-    'OPTIONS': 0x354,
-
     # Player tile/block coordinates (D363/D364) - finer-grained block positions
     'PLAYER_TILE_Y': 0x362,
     'PLAYER_TILE_X': 0x363,
-
-    # Event displacement / small event offsets
-    'EVENT_DISPLACEMENT_1': 0x35E,
-    'EVENT_DISPLACEMENT_2': 0x35F,
 
     # Player ID bytes (D359..D35A)
     'PLAYER_ID_LOW': 0x358,
@@ -58,12 +29,68 @@ RAM_ADDRESSES = {
     'PLAYER_NAME': 0x157,
     'PLAYER_NAME_LEN': 5,
 
+    # Map header (current loaded map)
+    # R/B symbols are D367..; Yellow often shifts many D000-window offsets by -1
+    'MAP_TILESET': 0x366,       # D367 tileset (Yellow -1)
+    'MAP_HEIGHT':  0x367,       # D368 height  (Yellow -1)
+    'MAP_WIDTH':   0x368,       # D369 width   (Yellow -1)
+    'MAP_CONNECTIONS': 0x36F,   # D370 connection byte (Yellow -1)
+
+    # Battle state
+    # D057 = Type of battle (0 when not in battle)
+    # D05A = Battle type (normal/safari/old man...)
+    'IN_BATTLE_FLAG': 0x056,  # absolute 0xD057
+    'BATTLE_TYPE': 0x059,     # absolute 0xD05A
+
     # Battle-related helper
     'BATTLE_MUSIC': 0x05B,
     'BATTLE_STATUS': 0x061,  # D062-D064 battle status bytes (player)
     'BATTLE_CRITICAL_FLAG': 0x05D,
     'BATTLE_HOOK_FLAG': 0x05E,
 
+    # Battle context (D000 window)
+    'BATTLE_PLAYER_PARTY_SLOT': 0x004,  # D005 (Yellow -1)
+    'BATTLE_ENEMY_PARTY_SLOT':  0x008,  # D009 (Yellow -1)
+    'BATTLE_ATTACK_MISSED':     0x06D,  # D06E (Yellow -1)
+    'DAMAGE_TO_BE_DEALT':       0x0D7,  # D0D8 (Yellow -1)
+
+    # Escape flag (Gen 1): non-zero when an item/move that allows escape was used.
+    # Community maps often label this `wEscapedFromBattle` / `wd078`.
+    # Yellow offsets are frequently -1 from R/B in the D000 window, so we keep a fallback.
+    'ESCAPED_FROM_BATTLE': 0x077,      # absolute 0xD078
+
+    # Party data (arrays of Pokémon data blocks)
+    # D163 = Party size (# Pokémon in party)
+    # D16C.. = current HP (2 bytes per mon), D18D.. = max HP (2 bytes per mon)
+    'PARTY_COUNT': 0x162,
+    'PARTY_CURRENT_HP': 0x16B,
+    'PARTY_MAX_HP': 0x18C,
+    'PARTY_BLOCK_SIZE': 0x2C,  # bytes between successive party entries
+
+    # Party extended signals (base fields; per-mon stride = PARTY_BLOCK_SIZE)
+    # Base offsets are for mon #0; add i*PARTY_BLOCK_SIZE for mon i
+    'PARTY_STATUS': 0x16E,      # D16F status (Yellow -1)
+    'PARTY_TYPE1':  0x170,      # D171 type1  (Yellow -1)
+    'PARTY_TYPE2':  0x171,      # D172 type2  (Yellow -1)
+    'PARTY_MOVES':  0x172,      # D173..D176 moves (Yellow -1)
+    'PARTY_EXP':    0x178,      # D179..D17B exp (Yellow -1)
+    'PARTY_LEVEL':  0x18B,      # D18C level  (Yellow -1)
+
+    # Game progress
+    # D356 contains badges as binary switches (bits set = badge owned)
+    'BADGES': 0x355,
+    # D347-D349 = money bytes (3-byte BCD, 6 decimal digits)
+    'MONEY': 0x346,
+
+    # Text/display-related (see notes) - D358/D359 are text-related flags/IDs
+    'TEXT_STATE': 0x357,
+    # Misc options (D355) - encodes battle animation, battle style, text speed nybble
+    'OPTIONS': 0x354,
+
+    # Event displacement / small event offsets
+    'EVENT_DISPLACEMENT_1': 0x35E,
+    'EVENT_DISPLACEMENT_2': 0x35F,
+    
     # Event flags base (D5A6..D5C5 contains many region-specific flags)
     'EVENT_FLAGS_BASE': 0x5A5,
 
@@ -71,7 +98,7 @@ RAM_ADDRESSES = {
     # (e.g. opponent roster at ~0x8A4). Add on demand.
     'OPPONENT_ROSTER_COUNT': 0x89B,
     'OPPONENT_POKEMON_BASE': 0x8A3,
-    'OPPONENT_POKEMON_BLOCK_SIZE': 0x10,
+    'OPPONENT_POKEMON_BLOCK_SIZE': 0x2C,
 
     # Game time (DA40..DA45)
     'GAME_TIME_HOURS': 0xA3F,
@@ -83,7 +110,60 @@ RAM_ADDRESSES = {
     # See DataCrystal / Red & Blue RAM map for more details; add on demand.
 }
 
-# Helper functions to decode RAM values
+
+# --- Absolute WRAM addresses (NOT relative to the 0xD000 window) ---
+# Yellow shares most of the same absolute WRAM symbols as R/B; the common
+# -1 offset note mainly affects many D000-window offsets in some community maps.
+# These are absolute addresses, so they do not use the -1 adjustment.
+ABS_WRAM_ADDRESSES = {
+    # Gen 1 (R/B/Y) battle result.
+    # 0x00 = battle started OR win
+    # 0x01 = loss
+    # 0x02 = draw (running away counts as draw)
+    'BATTLE_RESULT': 0xCF0B,
+    'BATTLE_TURN_COUNTER': 0xCCD5,
+    'PLAYER_SUBSTITUTE_HP': 0xCCD7,
+    'ENEMY_SUBSTITUTE_HP': 0xCCD8,    
+}
+
+
+def get_abs_byte(ram_data: bytes, abs_addr: int, base_address: Optional[int] = None) -> int:
+    """Read a byte at an absolute WRAM address.
+
+    Supports:
+      - a full 0xC000..0xDFFF dump (len >= 0x2000), where index 0 == 0xC000
+      - a buffer with an explicit `base_address` indicating address of ram_data[0]
+
+    Returns 0 on failure.
+    """
+    try:
+        if base_address is not None:
+            i = int(abs_addr) - int(base_address)
+            if i < 0 or i >= len(ram_data):
+                return 0
+            return int(ram_data[i]) & 0xFF
+
+        # Common case: env provides 0xC000..0xDFFF
+        if len(ram_data) >= 0x2000:
+            i = int(abs_addr) - 0xC000
+            if i < 0 or i >= len(ram_data):
+                return 0
+            return int(ram_data[i]) & 0xFF
+
+        # If caller provided only the 0xD000 slice, we cannot read Cxxx addresses.
+        return 0
+    except Exception:
+        return 0
+
+
+def decode_battle_result(ram_data: bytes) -> int:
+    """Return wBattleResult: 0=win/start, 1=loss, 2=draw/run-away. Returns -1 if unavailable."""
+    try:
+        if len(ram_data) < 0x2000:
+            return -1
+        return int(get_abs_byte(ram_data, ABS_WRAM_ADDRESSES['BATTLE_RESULT'])) & 0xFF
+    except Exception:
+        return -1
 
 def decode_player_position(ram_data: bytes) -> tuple:
     """Decode player position from RAM data.
@@ -119,6 +199,25 @@ def decode_in_battle(ram_data: bytes) -> bool:
         return False
 
 
+def decode_escaped_from_battle(ram_data: bytes) -> bool:
+    """Return True if an escape-from-battle item/move was used.
+
+    This corresponds to `wEscapedFromBattle` (often labeled `wd078`) which is
+    non-zero when an item or move that allows escape from battle was used.
+
+    """
+    try:
+        ram = to_d000_slice(ram_data)
+        off1 = RAM_ADDRESSES.get('ESCAPED_FROM_BATTLE')
+
+        if off1 is not None and off1 < len(ram) and (int(ram[off1]) & 0xFF) != 0:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
 def decode_badge_count(ram_data: bytes) -> int:
     """Return the number of badges owned (counts set bits in D356).
 
@@ -134,8 +233,28 @@ def decode_badge_count(ram_data: bytes) -> int:
         return 0
 
 
+
+def _bcd_byte_to_int(b: int) -> int:
+    """Convert one BCD byte (two decimal digits) to int.
+
+    Example: 0x42 -> 42
+    """
+    return (((b >> 4) & 0x0F) * 10) + (b & 0x0F)
+
+
+def money_bcd3_to_int(b0: int, b1: int, b2: int) -> int:
+    """Convert 3-byte BCD money (6 digits) to int.
+
+    Example: 0x12 0x34 0x56 -> 123456
+    """
+    return (_bcd_byte_to_int(b0) * 10000) + (_bcd_byte_to_int(b1) * 100) + _bcd_byte_to_int(b2)
+
+
 def decode_money(ram_data: bytes) -> int:
-    """Read 3-byte little-endian money value from D347..D349.
+    """Decode money value from D347..D349.
+
+    Gen 1 stores money as 3-byte BCD (6 decimal digits).
+    Example: 0x12 0x34 0x56 -> 123456
 
     Accepts WRAM slice or full dump; normalizes via `to_d000_slice`.
     Returns an integer amount (0 on out-of-bounds or malformed data).
@@ -143,13 +262,59 @@ def decode_money(ram_data: bytes) -> int:
     try:
         ram = to_d000_slice(ram_data)
         start = RAM_ADDRESSES['MONEY']
-        money_bytes = ram[start:start + 3]
-        if len(money_bytes) != 3:
+        b0 = int(ram[start]) & 0xFF
+        b1 = int(ram[start + 1]) & 0xFF
+        b2 = int(ram[start + 2]) & 0xFF
+        value = money_bcd3_to_int(b0, b1, b2)
+        # Defensive clamp
+        if value < 0:
             return 0
-        return money_bytes[0] | (money_bytes[1] << 8) | (money_bytes[2] << 16)
-    except (IndexError, ValueError):
+        if value > 999999:
+            return 999999
+        return int(value)
+    except (IndexError, KeyError, ValueError):
         return 0
 
+def decode_basic_game_info(ram_data: bytes) -> dict:
+    """Return a small, safe summary of commonly-used game state.
+
+    Keys: map_id, x, y, in_battle, badges, money
+    """
+    try:
+        ram = to_d000_slice(ram_data)
+        map_id, x, y = decode_player_position(ram)
+        in_battle = bool(decode_in_battle(ram))
+        badges = int(decode_badge_count(ram))
+        money = int(decode_money(ram))
+        return {
+            "map_id": int(map_id),
+            "x": int(x),
+            "y": int(y),
+            "in_battle": bool(in_battle),
+            "badges": int(badges),
+            "money": int(money),
+        }
+    except Exception:
+        return {
+            "map_id": 0,
+            "x": 0,
+            "y": 0,
+            "in_battle": False,
+            "badges": 0,
+            "money": 0,
+        }
+
+
+def get_opponent_roster_count(ram_data: bytes) -> int:
+    """Best-effort read of opponent roster count from WRAM. Returns 0 on failure."""
+    try:
+        ram = to_d000_slice(ram_data)
+        off = RAM_ADDRESSES.get("OPPONENT_ROSTER_COUNT")
+        if off is None or len(ram) <= off:
+            return 0
+        return int(ram[off]) & 0xFF
+    except Exception:
+        return 0
 
 def decode_party_stats(ram_data: bytes) -> list:
     """Return list of up to 6 party HP percentages (current/max) as floats.
@@ -210,33 +375,42 @@ def get_party_mon_hp(ram_data: bytes, index: int) -> tuple:
 
 
 def decode_opponent_pokemon(ram_data: bytes, index: int = 0) -> dict:
-    """Decode basic info about the opponent's Pokémon at `index`.
+    """Decode opponent party slot `index` using the Gen 1 enemy party struct (0x2C bytes each).
 
-    The opponent roster is located at D89C (count) and D8A4.. (each slot ~0x10 bytes).
-    This function returns a dict with keys: 'id', 'current_hp', 'max_hp', 'level',
-    'status', 'type1', 'type2', 'moves' (list), and 'raw_block'.
-
-    Offsets within the block are conservative and chosen for compatibility with
-    common Red/Blue/Yellow mappings. Tests use these offsets directly.
+    Layout (from enemy party list):
+      base+0x00 species
+      base+0x01..0x02 current HP (LE)
+      base+0x04 status
+      base+0x05 type1
+      base+0x06 type2
+      base+0x08..0x0B moves (4)
+      base+0x0E..0x10 exp (3, BE)
+      base+0x21 level
+      base+0x22..0x23 max HP (LE)
     """
     try:
         ram = to_d000_slice(ram_data)
-        roster_count = ram[RAM_ADDRESSES['OPPONENT_ROSTER_COUNT']]
+        roster_count = int(ram[RAM_ADDRESSES['OPPONENT_ROSTER_COUNT']]) & 0xFF
         if index < 0 or index >= roster_count:
             raise IndexError("opponent index out of range")
-        base = RAM_ADDRESSES['OPPONENT_POKEMON_BASE'] + index * RAM_ADDRESSES['OPPONENT_POKEMON_BLOCK_SIZE']
-        poke_id = ram[base]
-        cur_hp = ram[base + 1] | (ram[base + 2] << 8)
-        # Max HP commonly resides a few bytes later in the block
-        max_hp = ram[base + 4] | (ram[base + 5] << 8)
-        level = ram[base + 6]
-        status = ram[base + 3]
-        type1 = ram[base + 7]
-        type2 = ram[base + 8]
-        moves = [ram[base + 9], ram[base + 10], ram[base + 11], ram[base + 12]]
-        raw_block = ram[base: base + RAM_ADDRESSES['OPPONENT_POKEMON_BLOCK_SIZE']]
+
+        stride = RAM_ADDRESSES['OPPONENT_POKEMON_BLOCK_SIZE']
+        base = RAM_ADDRESSES['OPPONENT_POKEMON_BASE'] + index * stride
+
+        species = int(ram[base + 0x00]) & 0xFF
+        cur_hp = int(ram[base + 0x01]) | (int(ram[base + 0x02]) << 8)
+        status = int(ram[base + 0x04]) & 0xFF
+        type1 = int(ram[base + 0x05]) & 0xFF
+        type2 = int(ram[base + 0x06]) & 0xFF
+        moves = [int(ram[base + 0x08 + j]) & 0xFF for j in range(4)]
+        exp = _u24_be(ram[base + 0x0E], ram[base + 0x0F], ram[base + 0x10])
+        level = int(ram[base + 0x21]) & 0xFF
+        max_hp = int(ram[base + 0x22]) | (int(ram[base + 0x23]) << 8)
+
+        raw_block = bytes(ram[base: base + stride])
+
         return {
-            'id': poke_id,
+            'id': species,
             'current_hp': cur_hp,
             'max_hp': max_hp,
             'level': level,
@@ -244,12 +418,16 @@ def decode_opponent_pokemon(ram_data: bytes, index: int = 0) -> dict:
             'type1': type1,
             'type2': type2,
             'moves': moves,
+            'exp': int(exp),
             'raw_block': raw_block,
         }
-    except (IndexError, ValueError):
-        return {'id': 0, 'current_hp': 0, 'max_hp': 0, 'level': 0, 'status': 0, 'type1': 0, 'type2': 0, 'moves': [], 'raw_block': b''}
-
-
+    except Exception:
+        return {
+            'id': 0, 'current_hp': 0, 'max_hp': 0, 'level': 0,
+            'status': 0, 'type1': 0, 'type2': 0, 'moves': [],
+            'exp': 0, 'raw_block': b''
+        }
+    
 def decode_text_state(ram_data: bytes) -> int:
     """Return text state / text-speed flags (D358).
 
@@ -383,7 +561,7 @@ def pretty_print_battle(ram_data: bytes) -> dict:
             cur, maxhp = get_party_mon_hp(ram, i)
             party_list.append({'index': i, 'current_hp': cur, 'max_hp': maxhp})
         opponents = []
-        roster = ram[RAM_ADDRESSES['OPPONENT_ROSTER_COUNT']]
+        roster = get_opponent_roster_count(ram)
         for i in range(roster):
             opponents.append(decode_opponent_pokemon(ram, i))
         return {
@@ -397,59 +575,166 @@ def pretty_print_battle(ram_data: bytes) -> dict:
 
 
 def get_observation_vector(ram_data: bytes) -> list:
-    """Create compact observation vector from RAM data.
+    """Create compact normalized observation vector from RAM data.
 
-    Vector layout:
-      [map_id, player_x, player_y, in_battle, badges_count, money, text_state, party_hp[0..5]]
-
-    Accepts WRAM slice or full dump; normalizes via `to_d000_slice`.
+    NOTE: Upgraded to v2 (43-dim) for richer training signals.
     """
-    ram = to_d000_slice(ram_data)
-    position = decode_player_position(ram)
-    in_battle = decode_in_battle(ram)
-    badges = decode_badge_count(ram)
-    money = decode_money(ram)
-    party_hp = decode_party_stats(ram)
-    text_state = decode_text_state(ram)
+    return get_observation_vector_v2(ram_data)
 
-    obs_vector = [
-        position[0],  # map_id
-        position[1],  # player_x
-        position[2],  # player_y
-        int(in_battle),
-        badges,
-        money,
-        text_state,
-    ]
-    obs_vector.extend(party_hp)
-    return obs_vector
+def get_observation_vector_v2(ram_data: bytes) -> list:
+    """Expanded normalized observation vector (43 floats).
 
+    Layout:
+      0  map_id/255
+      1  x/255
+      2  y/255
+      3  in_battle (0/1)
+      4  badges/8
+      5  money/999999
+      6  text_state/255
 
-def get_observation_vector(ram_data: bytes) -> list:
-    """Create compact observation vector from RAM data.
+      7  tileset/255
+      8  map_height/255
+      9  map_width/255
+      10 connections/255
 
-    Vector layout:
-      [map_id, player_x, player_y, in_battle, badges_count, money, text_state, party_hp[0..5]]
+      11 party_count/6
+
+      12..17  party_hp[0..5] (0..1)
+      18..23  party_levels[0..5] / 100
+      24..29  party_statuses[0..5] / 255
+
+      30 player_party_slot/5
+      31 enemy_party_slot/5
+      32 attack_missed (0/1)
+      33 pending_damage/255
+      34 battle_turn_counter/255
+      35 player_sub_hp/255
+      36 enemy_sub_hp/255
+
+      37 opponent_roster_count/6
+      38 opponent0_hp_ratio (0..1)
+      39 opponent0_level/100
+      40 opponent0_status/255
+      41 opponent0_type1/15
+      42 opponent0_type2/15
     """
-    position = decode_player_position(ram_data)
-    in_battle = decode_in_battle(ram_data)
-    badges = decode_badge_count(ram_data)
-    money = decode_money(ram_data)
-    party_hp = decode_party_stats(ram_data)
-    text_state = decode_text_state(ram_data)
+    try:
+        # normalize to 0xD000 slice for Dxxx offsets
+        ram = to_d000_slice(ram_data)
 
-    obs_vector = [
-        position[0],  # map_id
-        position[1],  # player_x
-        position[2],  # player_y
-        int(in_battle),
-        badges,
-        money,
-        text_state,
-    ]
-    obs_vector.extend(party_hp)
-    return obs_vector
+        map_id, x, y = decode_player_position(ram)
+        in_battle = 1.0 if decode_in_battle(ram) else 0.0
+        badges = float(decode_badge_count(ram))
+        money = float(decode_money(ram))
+        text_state = float(decode_text_state(ram))
 
+        mh = decode_map_header(ram)
+        tileset = float(mh.get("tileset", 0))
+        mheight = float(mh.get("height", 0))
+        mwidth = float(mh.get("width", 0))
+        mconn = float(mh.get("connections", 0))
+
+        party_count = float(get_party_count(ram))
+        if party_count < 0:
+            party_count = 0.0
+        if party_count > 6:
+            party_count = 6.0
+
+        party_hp = decode_party_stats(ram)              # 6 floats
+        party_lv = decode_party_levels(ram)             # 6 ints
+        party_st = decode_party_statuses(ram)           # 6 ints
+
+        bc = decode_battle_context(ram)
+        pslot = float(bc.get("player_party_slot", 0))
+        eslot = float(bc.get("enemy_party_slot", 0))
+        attack_missed = 1.0 if int(bc.get("attack_missed", 0)) != 0 else 0.0
+        pending_damage = float(bc.get("pending_damage", 0))
+
+        # Absolute WRAM reads require 0xC000..0xDFFF buffer; if not available they return 0.
+        turn_counter = float(decode_battle_turn_counter(ram_data))
+        sub = decode_substitute_hp(ram_data)
+        sub_p = float(sub.get("player", 0))
+        sub_e = float(sub.get("enemy", 0))
+
+        roster = float(get_opponent_roster_count(ram))
+        if roster < 0:
+            roster = 0.0
+        if roster > 6:
+            roster = 6.0
+
+        opp0 = decode_opponent_pokemon(ram, 0)
+        opp0_hp_ratio = 0.0
+        try:
+            chp = float(opp0.get("current_hp", 0))
+            mhp = float(opp0.get("max_hp", 0))
+            opp0_hp_ratio = (chp / mhp) if mhp > 0 else 0.0
+        except Exception:
+            opp0_hp_ratio = 0.0
+
+        opp0_level = float(opp0.get("level", 0))
+        opp0_status = float(opp0.get("status", 0))
+        opp0_type1 = float(opp0.get("type1", 0))
+        opp0_type2 = float(opp0.get("type2", 0))
+
+        obs = [
+            float(map_id) / 255.0,
+            float(x) / 255.0,
+            float(y) / 255.0,
+            in_battle,
+            badges / 8.0,
+            min(money, 999999.0) / 999999.0,
+            text_state / 255.0,
+
+            tileset / 255.0,
+            mheight / 255.0,
+            mwidth / 255.0,
+            mconn / 255.0,
+
+            party_count / 6.0,
+        ]
+
+        # party hp already 0..1
+        obs.extend([float(v) for v in party_hp[:6]])
+
+        # party levels normalize by 100 (cap defensively)
+        for v in party_lv[:6]:
+            vv = float(v)
+            if vv < 0:
+                vv = 0.0
+            if vv > 100:
+                vv = 100.0
+            obs.append(vv / 100.0)
+
+        # party status bytes /255
+        obs.extend([float(int(v) & 0xFF) / 255.0 for v in party_st[:6]])
+
+        # battle context
+        obs.append(min(pslot, 5.0) / 5.0)
+        obs.append(min(eslot, 5.0) / 5.0)
+        obs.append(attack_missed)
+        obs.append(min(pending_damage, 255.0) / 255.0)
+        obs.append(min(turn_counter, 255.0) / 255.0)
+        obs.append(min(sub_p, 255.0) / 255.0)
+        obs.append(min(sub_e, 255.0) / 255.0)
+
+        # opponent summary
+        obs.append(roster / 6.0)
+        obs.append(float(opp0_hp_ratio))
+        obs.append(min(opp0_level, 100.0) / 100.0)
+        obs.append(min(opp0_status, 255.0) / 255.0)
+        obs.append(min(opp0_type1, 15.0) / 15.0)
+        obs.append(min(opp0_type2, 15.0) / 15.0)
+
+        # Ensure exact length
+        if len(obs) < 43:
+            obs.extend([0.0] * (43 - len(obs)))
+        elif len(obs) > 43:
+            obs = obs[:43]
+
+        return obs
+    except Exception:
+        return [0.0] * 43
 
 # --- Human-friendly name mappings and game-variant helpers (Yellow quirks) ---
 # Note: Move IDs and Type IDs in Gen 1 can be extracted from the ROM's text tables.
@@ -470,9 +755,6 @@ MOVE_ID_TO_NAME = {
     1: 'Pound', 2: 'Karate Chop', 3: 'Double Slap', 4: 'Comet Punch',
     15: 'Thunderbolt', 17: 'Thunder', 33: 'Quick Attack', 45: 'Growl'
 }
-
-GAME_VARIANT = None
-
 
 def type_id_to_name(type_id: int) -> str:
     """Return the human-readable name for a type id (falls back to 'Type #')."""
@@ -504,83 +786,17 @@ def load_move_table_from_rom(rom_path: str) -> dict:
         return {}
 
 
-def set_game_variant(variant: str):
-    """Set game variant to apply any known quirks for parsing RAM.
-
-    Supported variants: 'yellow' (applies Yellow-specific quirks such as
-    certain offset adjustments and name lengths). This function mutates
-    `RAM_ADDRESSES` in-place only for known adjustments and records the
-    selected variant in `GAME_VARIANT`.
-    """
-    global GAME_VARIANT
-    variant = variant.lower().strip()
-    if variant == 'yellow':
-        apply_yellow_quirks()
-        GAME_VARIANT = 'yellow'
-    else:
-        GAME_VARIANT = variant
-
-
-def apply_yellow_quirks():
-    """Apply a small set of Yellow-specific corrections to `RAM_ADDRESSES`.
-
-    DataCrystal notes that many offsets in Yellow are shifted by -1 relative
-    to Red/Blue. This function applies a conservative set of overrides that
-    are known to differ in Yellow. It avoids global blind shifts to prevent
-    regressions; use `apply_yellow_shift_all` if you explicitly want to
-    apply a -1 offset to a conservative set of addresses.
-    """
-    # Conservative, well-documented adjustments for Yellow (do not change
-    # values that are already correct to avoid regressions)
-    overrides = {
-        # Player name length in Yellow is commonly 7 bytes (vs 5 in some tables)
-        'PLAYER_NAME_LEN': 7,
-    }
-    RAM_ADDRESSES.update(overrides)
-
-
-# Keys that are known to commonly be shifted by -1 in Yellow vs Red/Blue.
-YELLOW_SHIFTED_KEYS = [
-    'PLAYER_MAP_ID', 'PLAYER_MAP_Y', 'PLAYER_MAP_X',
-    'PARTY_COUNT', 'PARTY_CURRENT_HP', 'PARTY_MAX_HP', 'PARTY_BLOCK_SIZE',
-    'BADGES', 'MONEY', 'TEXT_STATE', 'OPTIONS', 'PLAYER_TILE_Y', 'PLAYER_TILE_X',
-    'PLAYER_ID_LOW', 'PLAYER_ID_HIGH', 'PLAYER_NAME'
-]
-
-
-def shift_offsets(offset_map: dict, keys: list, delta: int = -1) -> dict:
-    """Return a new offset map with the given keys shifted by `delta`.
-
-    Does not mutate the original map; returns a shallow copy with adjustments.
-    """
-    new_map = dict(offset_map)
-    for k in keys:
-        if k in new_map and isinstance(new_map[k], int):
-            new_map[k] = new_map[k] + delta
-    return new_map
-
-
-def apply_yellow_shift_all():
-    """Apply a -1 shift to a conservative set of addresses in-place.
-
-    WARNING: This mutates global `RAM_ADDRESSES`. Use only if you are
-    certain your offsets are Red/Blue-derived and need Yellow adjustments.
-    """
-    global RAM_ADDRESSES
-    RAM_ADDRESSES = shift_offsets(RAM_ADDRESSES, YELLOW_SHIFTED_KEYS, -1)
-
-
-def get_game_variant() -> Optional[str]:
-    return GAME_VARIANT
-
-
 def get_raw_ram_slice(ram_data: bytes, start: int = 0, length: int = 0x1000) -> bytes:
     """Get a slice of RAM data from the 0xD000 WRAM window.
 
     By default this returns a 0x1000 (4KB) slice consistent with the
     offsets used in this module (offsets are relative to 0xD000).
     """
-    return ram_data[start:start + length]
+    try:
+        ram = to_d000_slice(ram_data)
+        return ram[start:start + length]
+    except Exception:
+        return b""
 
 
 # Utility accessors
@@ -645,3 +861,114 @@ def to_d000_slice(ram_data: bytes, base_address: Optional[int] = None) -> bytes:
         return ram_data[d000_offset:d000_offset + 0x1000]
 
     raise ValueError("ram_data length not long enough to infer a 0xD000..0xDFFF slice")
+
+def decode_map_header(ram_data: bytes) -> dict:
+    """Decode basic map header fields (tileset, height/width, connection byte)."""
+    try:
+        ram = to_d000_slice(ram_data)
+        return {
+            "tileset": int(ram[RAM_ADDRESSES["MAP_TILESET"]]) & 0xFF,
+            "height": int(ram[RAM_ADDRESSES["MAP_HEIGHT"]]) & 0xFF,
+            "width": int(ram[RAM_ADDRESSES["MAP_WIDTH"]]) & 0xFF,
+            "connections": int(ram[RAM_ADDRESSES["MAP_CONNECTIONS"]]) & 0xFF,
+        }
+    except Exception:
+        return {"tileset": 0, "height": 0, "width": 0, "connections": 0}
+    
+def _u24_be(b0: int, b1: int, b2: int) -> int:
+    """Gen 1 EXP is commonly stored as 3 bytes, big-endian."""
+    return ((int(b0) & 0xFF) << 16) | ((int(b1) & 0xFF) << 8) | (int(b2) & 0xFF)
+
+def decode_party_levels(ram_data: bytes) -> list:
+    """Return up to 6 party levels."""
+    out = [0] * 6
+    try:
+        ram = to_d000_slice(ram_data)
+        count = min(int(ram[RAM_ADDRESSES['PARTY_COUNT']]) & 0xFF, 6)
+        stride = RAM_ADDRESSES['PARTY_BLOCK_SIZE']
+        base = RAM_ADDRESSES['PARTY_LEVEL']
+        for i in range(count):
+            out[i] = int(ram[base + i * stride]) & 0xFF
+    except Exception:
+        pass
+    return out
+
+def decode_party_statuses(ram_data: bytes) -> list:
+    """Return up to 6 party status bytes."""
+    out = [0] * 6
+    try:
+        ram = to_d000_slice(ram_data)
+        count = min(int(ram[RAM_ADDRESSES['PARTY_COUNT']]) & 0xFF, 6)
+        stride = RAM_ADDRESSES['PARTY_BLOCK_SIZE']
+        base = RAM_ADDRESSES['PARTY_STATUS']
+        for i in range(count):
+            out[i] = int(ram[base + i * stride]) & 0xFF
+    except Exception:
+        pass
+    return out
+
+def decode_party_moves(ram_data: bytes) -> list:
+    """Return up to 6 party move lists (each 4 move IDs)."""
+    out = [[0, 0, 0, 0] for _ in range(6)]
+    try:
+        ram = to_d000_slice(ram_data)
+        count = min(int(ram[RAM_ADDRESSES['PARTY_COUNT']]) & 0xFF, 6)
+        stride = RAM_ADDRESSES['PARTY_BLOCK_SIZE']
+        base = RAM_ADDRESSES['PARTY_MOVES']
+        for i in range(count):
+            o = base + i * stride
+            out[i] = [int(ram[o + j]) & 0xFF for j in range(4)]
+    except Exception:
+        pass
+    return out
+
+def decode_party_exp(ram_data: bytes) -> list:
+    """Return up to 6 party EXP values as ints."""
+    out = [0] * 6
+    try:
+        ram = to_d000_slice(ram_data)
+        count = min(int(ram[RAM_ADDRESSES['PARTY_COUNT']]) & 0xFF, 6)
+        stride = RAM_ADDRESSES['PARTY_BLOCK_SIZE']
+        base = RAM_ADDRESSES['PARTY_EXP']
+        for i in range(count):
+            o = base + i * stride
+            out[i] = _u24_be(ram[o], ram[o + 1], ram[o + 2])
+    except Exception:
+        pass
+    return out
+    
+def decode_battle_context(ram_data: bytes) -> dict:
+    """Battle context signals useful for shaping + debugging."""
+    try:
+        ram = to_d000_slice(ram_data)
+        return {
+            "player_party_slot": int(ram[RAM_ADDRESSES["BATTLE_PLAYER_PARTY_SLOT"]]) & 0xFF,
+            "enemy_party_slot": int(ram[RAM_ADDRESSES["BATTLE_ENEMY_PARTY_SLOT"]]) & 0xFF,
+            "attack_missed": int(ram[RAM_ADDRESSES["BATTLE_ATTACK_MISSED"]]) & 0xFF,
+            "pending_damage": int(ram[RAM_ADDRESSES["DAMAGE_TO_BE_DEALT"]]) & 0xFF,
+        }
+    except Exception:
+        return {"player_party_slot": 0, "enemy_party_slot": 0, "attack_missed": 0, "pending_damage": 0}    
+    
+def get_abs_word_le(ram_data: bytes, abs_addr: int, base_address: Optional[int] = None) -> int:
+    """Read a little-endian 16-bit value at an absolute WRAM address."""
+    lo = get_abs_byte(ram_data, abs_addr, base_address=base_address)
+    hi = get_abs_byte(ram_data, abs_addr + 1, base_address=base_address)
+    return (hi << 8) | lo
+
+def decode_battle_turn_counter(ram_data: bytes) -> int:
+    """Return battle turn counter (0 if unavailable)."""
+    try:
+        return int(get_abs_byte(ram_data, ABS_WRAM_ADDRESSES['BATTLE_TURN_COUNTER'])) & 0xFF
+    except Exception:
+        return 0
+
+def decode_substitute_hp(ram_data: bytes) -> dict:
+    """Return substitute HP bytes (player/enemy)."""
+    try:
+        return {
+            "player": int(get_abs_byte(ram_data, ABS_WRAM_ADDRESSES['PLAYER_SUBSTITUTE_HP'])) & 0xFF,
+            "enemy": int(get_abs_byte(ram_data, ABS_WRAM_ADDRESSES['ENEMY_SUBSTITUTE_HP'])) & 0xFF,
+        }
+    except Exception:
+        return {"player": 0, "enemy": 0}    

@@ -7,6 +7,167 @@ import time
 from datetime import datetime
 import numpy as np
 import json
+from typing import Optional
+
+# Map id -> name (overlay location)
+try:
+    from memory.map_names import map_name as _map_name
+except Exception:
+    def _map_name(map_id):
+        return "Unknown"
+    
+class HybridTuningCallback(BaseCallback):
+    """Option C: manual phase gating, automatic tuning within a phase.
+
+    This callback does NOT change TRAINING_PHASE.
+    It only anneals/shifts reward component multipliers based on live progress signals.
+
+    Signals used: tiles_visited (from env info), and global timesteps (SB3 num_timesteps).
+    """
+
+    def __init__(
+        self,
+        update_freq: int = 2000,
+        target_tiles: int = 400,
+        target_steps: int = 5000,
+        min_exploration_mult: float = 0.30,
+        max_exploration_mult: float = 1.00,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.update_freq = int(update_freq)
+        self.target_tiles = int(target_tiles)
+        self.target_steps = int(target_steps)
+        self.min_exploration_mult = float(min_exploration_mult)
+        self.max_exploration_mult = float(max_exploration_mult)
+        self._last_sent = None
+        # Weighted blend for progress signals (tiles vs steps)
+        # Defaults are tuned for Pokémon exploration so tiles dominate early.
+        try:
+            self.blend_tiles_weight = float(os.getenv('TUNING_BLEND_TILES_WEIGHT', '0.7'))
+        except Exception:
+            self.blend_tiles_weight = 0.7
+        try:
+            self.blend_steps_weight = float(os.getenv('TUNING_BLEND_STEPS_WEIGHT', '0.3'))
+        except Exception:
+            self.blend_steps_weight = 0.3
+        # Track global steps since the current phase began (phase is manual in Option C)
+        self._phase_start_timesteps = 0
+        self._last_phase = None
+
+    def _extract_info0(self) -> dict:
+        # VecEnv -> list of dicts
+        try:
+            infos = self.locals.get('infos', None)
+            if isinstance(infos, (list, tuple)) and len(infos) > 0 and isinstance(infos[0], dict):
+                return infos[0]
+            if isinstance(infos, dict):
+                return infos
+        except Exception:
+            pass
+        return {}
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.update_freq != 0:
+            return True
+
+        info0 = self._extract_info0()
+
+        # Read progress
+        try:
+            tiles = int(info0.get('tiles_visited', 0) or 0)
+        except Exception:
+            tiles = 0
+
+        # Secondary progress signal: global timesteps (more stable than per-episode steps).
+        # We use "timesteps since phase start" so the annealing restarts when you manually bump phases.
+        phase = None
+        try:
+            ph_list = self.training_env.env_method('get_phase')
+            if isinstance(ph_list, (list, tuple)) and len(ph_list) > 0:
+                phase = int(ph_list[0])
+        except Exception:
+            phase = None
+
+        # If phase changes (manual gating), reset the phase baseline for timesteps
+        if phase is not None and phase != self._last_phase:
+            self._last_phase = phase
+            self._phase_start_timesteps = int(getattr(self, 'num_timesteps', 0) or 0)
+
+        # Steps since the current phase began
+        ep_steps = int(getattr(self, 'num_timesteps', 0) or 0) - int(getattr(self, '_phase_start_timesteps', 0) or 0)
+        if ep_steps < 0:
+            ep_steps = 0
+
+        # Anneal exploration multiplier down as progress increases.
+        # Primary signal: tiles_visited
+        # Secondary signal: global timesteps since phase start (so we still anneal even if tiles stall)
+
+        frac_tiles = 0.0
+        if self.target_tiles > 0:
+            frac_tiles = float(min(max(tiles / float(self.target_tiles), 0.0), 1.0))
+
+        frac_steps = 0.0
+        if self.target_steps > 0:
+            frac_steps = float(min(max(ep_steps / float(self.target_steps), 0.0), 1.0))
+
+        # Combine using a weighted blend (prevents steps from dominating too early)
+        tw = float(getattr(self, 'blend_tiles_weight', 0.7) or 0.7)
+        sw = float(getattr(self, 'blend_steps_weight', 0.3) or 0.3)
+        # Normalize defensively
+        if tw < 0.0:
+            tw = 0.0
+        if sw < 0.0:
+            sw = 0.0
+        denom = (tw + sw)
+        if denom <= 0.0:
+            tw, sw, denom = 0.7, 0.3, 1.0
+        tw /= denom
+        sw /= denom
+
+        frac = (tw * frac_tiles) + (sw * frac_steps)
+        frac = float(min(max(frac, 0.0), 1.0))
+
+        exploration_mult = (self.max_exploration_mult * (1.0 - frac)) + (self.min_exploration_mult * frac)
+
+        # Light anti-stuck boost when exploration is low (keeps movement pressure)
+        stuck_mult = 1.0
+        if exploration_mult <= (self.min_exploration_mult + 0.05):
+            stuck_mult = 1.25
+
+        multipliers = {
+            'exploration': float(exploration_mult),
+            'stuck': float(stuck_mult),
+        }
+
+        # Avoid spam if unchanged
+        sig = (round(exploration_mult, 3), round(stuck_mult, 3))
+        if self._last_sent == sig:
+            return True
+        self._last_sent = sig
+
+        # Push updates into all envs
+        try:
+            self.training_env.env_method('set_reward_multipliers', multipliers)
+        except Exception:
+            # Fallback for some wrappers
+            try:
+                self.training_env.get_attr('set_reward_multipliers')
+                self.training_env.env_method('set_reward_multipliers', multipliers)
+            except Exception:
+                pass
+
+        if self.verbose > 0:
+            gsteps = int(getattr(self, 'num_timesteps', 0) or 0)
+            tw = float(getattr(self, 'blend_tiles_weight', 0.7) or 0.7)
+            sw = float(getattr(self, 'blend_steps_weight', 0.3) or 0.3)
+            print(
+                f"[HybridTuning] tiles={tiles} phase={phase} phase_steps={ep_steps} global_steps={gsteps} "
+                f"blend=({tw:.2f},{sw:.2f}) frac_tiles={frac_tiles:.3f} frac_steps={frac_steps:.3f} "
+                f"exploration_mult={exploration_mult:.3f} stuck_mult={stuck_mult:.3f}"
+            )
+
+        return True
 
 class CheckpointCallback(BaseCallback):
     """
@@ -96,117 +257,144 @@ class TensorboardCallback(BaseCallback):
 
 class OverlayCallback(BaseCallback):
     """
-    Callback to POST basic training stats to the overlay server so the overlay can show live training info.
+    Callback to POST training stats to the overlay server so the overlay can show live training info.
     """
     def __init__(self, url: str = "http://127.0.0.1:8080/update", update_freq: int = 1000, verbose: int = 0):
         super(OverlayCallback, self).__init__(verbose)
         self.url = url
-        self.update_freq = update_freq
+        self.update_freq = int(update_freq)
         self.action_counts = {}
         self.total_actions = 0
-        self.last_action = None
-        self.env = None
-
-    def _on_step(self) -> bool:
-        # For now, we send minimal data since we don't have access to environment stats
-        # This can be extended to track stats if needed
-        if self.n_calls % self.update_freq == 0:
-            # Initialize action confidence with zeros
-            action_confidence = {
-                'up': 0.0,
-                'down': 0.0,
-                'left': 0.0,
-                'right': 0.0,
-                'a': 0.0,
-                'b': 0.0
-            }
-            
-            # If we have action data, update confidence
-            if self.total_actions > 0:
-                for action_name, count in self.action_counts.items():
-                    # Convert action name to lowercase for matching
-                    if action_name.lower() in action_confidence:
-                        action_confidence[action_name.lower()] = count / self.total_actions
-
-            payload = {
-                'stats': {
-                    'episode_steps': int(self.n_calls)
-                },
-                'commentary': f'Training step {self.n_calls}',
-                'action_confidence': action_confidence,
-                'game_state': {
-                    'location': 'unknown',
-                    'x': 0,
-                    'y': 0,
-                    'in_battle': False,
-                    'in_menu': False
-                }
-            }
-            try:
-                import requests
-                requests.post(self.url, json=payload, timeout=1)
-            except Exception as e:
-                if self.verbose > 0:
-                    print(f"Overlay update failed: {e}")
-        return True
+        # Global/phase step tracking for overlays
+        self._phase_start_timesteps = 0
+        self._last_phase = None
 
     def _on_training_start(self) -> None:
-        """Initialize training callback."""
-        # This would be called at training start
         self.action_counts = {}
         self.total_actions = 0
-        self.last_action = None
 
-    def _on_training_end(self) -> None:
-        """Clean up at the end of training."""
-        # This would be called at training end
-        pass
-        
-    def update_action_counts(self, action: int):
-        """Update action counts for overlay display."""
-        from actions import ACTIONS
-        action_name = ACTIONS.get(action, 'UNKNOWN').lower()
-        if action_name != 'unknown':
-            # Map action names to the ones used in overlay
-            if action_name == 'up':
-                overlay_action = 'up'
-            elif action_name == 'down':
-                overlay_action = 'down'
-            elif action_name == 'left':
-                overlay_action = 'left'
-            elif action_name == 'right':
-                overlay_action = 'right'
-            elif action_name == 'a':
-                overlay_action = 'a'
-            elif action_name == 'b':
-                overlay_action = 'b'
-            else:
-                overlay_action = action_name  # fallback for other actions
-                
-            self.action_counts[overlay_action] = self.action_counts.get(overlay_action, 0) + 1
-            self.total_actions += 1
-            
-    def get_action_confidence(self):
-        """Get current action confidence values for overlay display."""
-        action_confidence = {
-            'up': 0.0,
-            'down': 0.0,
-            'left': 0.0,
-            'right': 0.0,
-            'a': 0.0,
-            'b': 0.0
-        }
-        
+    def _update_action_counts_from_action(self, action: int):
+        """Update action counts using ACTIONS mapping; splits combo actions like UP_A."""
+        try:
+            from actions import ACTIONS
+            name = ACTIONS.get(int(action), 'UNKNOWN')
+        except Exception:
+            name = 'UNKNOWN'
+
+        if name == 'UNKNOWN':
+            return
+
+        # Split combo actions like UP_A into UP + A
+        parts = name.split('_') if '_' in name else [name]
+
+        for p in parts:
+            key = p.lower()
+            if key in ['up', 'down', 'left', 'right', 'a', 'b']:
+                self.action_counts[key] = self.action_counts.get(key, 0) + 1
+                self.total_actions += 1
+
+    def _on_step(self) -> bool:
+        # Update action counts every step if actions are available
+        try:
+            actions = self.locals.get('actions', None)
+            if actions is not None:
+                # VecEnv returns array-like actions
+                if isinstance(actions, (list, tuple, np.ndarray)):
+                    for a in np.array(actions).flatten().tolist():
+                        self._update_action_counts_from_action(int(a))
+                else:
+                    self._update_action_counts_from_action(int(actions))
+        except Exception:
+            pass
+
+        # Only POST every update_freq callback steps
+        if self.n_calls % self.update_freq != 0:
+            return True
+
+        # Build action confidence (defaults to zero)
+        action_confidence = {'up': 0.0, 'down': 0.0, 'left': 0.0, 'right': 0.0, 'a': 0.0, 'b': 0.0}
         if self.total_actions > 0:
-            for action_name, count in self.action_counts.items():
-                if action_name.lower() in action_confidence:
-                    action_confidence[action_name.lower()] = count / self.total_actions
-                    
-        return action_confidence
-        
-    def set_env(self, env):
-        """Set the environment to access its action tracking."""
-        self.env = env
+            for k in action_confidence.keys():
+                action_confidence[k] = float(self.action_counts.get(k, 0)) / float(self.total_actions)
+
+        # Pull most recent env info if available (VecEnv -> list of dicts)
+        info0 = {}
+        try:
+            infos = self.locals.get('infos', None)
+            if isinstance(infos, (list, tuple)) and len(infos) > 0 and isinstance(infos[0], dict):
+                info0 = infos[0]
+            elif isinstance(infos, dict):
+                info0 = infos
+        except Exception:
+            info0 = {}
+
+        def _iget(key, default):
+            try:
+                v = info0.get(key, default)
+                return default if v is None else v
+            except Exception:
+                return default
+
+        # --- Compute global steps and phase/phase_steps ---
+        # Global step counter (SB3)
+        global_steps = int(getattr(self, 'num_timesteps', 0) or 0)
+
+        # Optional: phase + steps since phase start (restarts when you manually bump TRAINING_PHASE)
+        phase = None
+        try:
+            ph_list = self.training_env.env_method('get_phase')
+            if isinstance(ph_list, (list, tuple)) and len(ph_list) > 0:
+                phase = int(ph_list[0])
+        except Exception:
+            phase = None
+
+        if phase is not None and phase != self._last_phase:
+            self._last_phase = phase
+            self._phase_start_timesteps = global_steps
+
+        phase_steps = global_steps - int(getattr(self, '_phase_start_timesteps', 0) or 0)
+        if phase_steps < 0:
+            phase_steps = 0
+        # --- end compute global/phase steps ---
+
+        map_id = _iget('map_id', None)
+        try:
+            map_id_int = int(map_id) if map_id is not None else None
+        except Exception:
+            map_id_int = None
+
+        payload = {
+            'stats': {
+                'episode_steps': int(_iget('episode_steps', 0)),
+                'global_steps': int(global_steps),
+                'phase': int(phase) if phase is not None else None,
+                'phase_steps': int(phase_steps),
+                'tiles_visited': int(_iget('tiles_visited', 0)),
+                'battles_won': int(_iget('battles_won', 0)),
+                'battles_lost': int(_iget('battles_lost', 0)),
+                'badges': int(_iget('badges', 0)),
+                'money': int(_iget('money', 0)),
+            },
+            'commentary': f'Training global_steps {global_steps}',
+            'action_confidence': action_confidence,
+            'game_state': {
+                'map_id': map_id_int,
+                'location': _map_name(map_id_int),
+                'x': int(_iget('x', 0)),
+                'y': int(_iget('y', 0)),
+                'in_battle': bool(_iget('in_battle', False)),
+                'in_menu': bool(_iget('in_menu', False)),
+            }
+        }
+
+        try:
+            import requests
+            requests.post(self.url, json=payload, timeout=1)
+        except Exception as e:
+            if self.verbose > 0:
+                print(f"Overlay update failed: {e}")
+
+        return True
 
 class ProgressCallback(BaseCallback):
     """

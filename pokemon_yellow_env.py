@@ -22,7 +22,7 @@ class PokemonYellowEnv(gym.Env):
     Gym-style environment for Pokémon Yellow RL training using PyBoy emulator.
     """
     
-    def __init__(self):
+    def __init__(self, phase: int = 1, reward_shaper=None):
         super(PokemonYellowEnv, self).__init__()
         
         # Define action space (discrete buttons)
@@ -32,9 +32,7 @@ class PokemonYellowEnv(gym.Env):
 
         # Define observation space (WRAM slice used by Pokémon Yellow: 0xD000..0xDFFF)
         # WRAM window here is 0x1000 bytes (4KB) and memory_map offsets are relative to 0xD000
-        self.observation_space = spaces.Box(
-            low=0, high=255, shape=(0x1000,), dtype=np.uint8
-        )
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(43,), dtype=np.float32)
         
         # Emulator and state management
         self.emulator_path = os.getenv("EMULATOR_PATH") or "pokemon_yellow.gb"
@@ -43,6 +41,13 @@ class PokemonYellowEnv(gym.Env):
         self.current_state = None
         self.window = os.getenv("WINDOW") or "null"
         self.shouldRender = self.window != "null"
+        # Debug toggles (use NUM_ENVS=1 when enabling to avoid log spam)
+        self.debug_pos = os.getenv("DEBUG_POS", "false").lower() == "true"
+        try:
+            self.debug_pos_every = int(os.getenv("DEBUG_POS_EVERY", "250"))
+        except Exception:
+            self.debug_pos_every = 250
+        self._debug_last_printed = None
         # Training parameters
         self.frame_skip = 4
         self.action_repeat = 4
@@ -54,21 +59,20 @@ class PokemonYellowEnv(gym.Env):
         self.tiles_visited = set()
         self.last_position = None
 
-        # Previous state for change detection (used for reward shaping and outcomes)
-        self._prev_in_battle = False
-        self._prev_badges = 0
-        self._prev_money = 0
-        self._prev_party_hp = [0.0] * 6
-        self._last_battle_result = None  # 'win' | 'loss' | None
-        # Track previous opponent roster count to detect end-of-battle via roster clearing
-        self._prev_opponent_roster_count = 0
-        # Previous battle type (set lazily)
-        self._prev_battle_type = None
-        
+        # Battle transition tracking (for run-away detection)
+        self._prev_in_battle_env = False
+
         # Action tracking for overlay
         self.action_counts = {}
         self.total_actions = 0
         
+        # Reward shaping (phase-based)
+        if reward_shaper is None:
+            from rewards import PhaseRewardShaper
+            self.reward_shaper = PhaseRewardShaper(phase=phase)
+        else:
+            self.reward_shaper = reward_shaper
+            
         # Initialize emulator
         self._init_emulator()
         
@@ -86,9 +90,7 @@ class PokemonYellowEnv(gym.Env):
             self.emulator_path,
             cgb=True,
             window=self.window,  # Use null window mode for training (replacing deprecated "headless")
-            # Optionally enable sound if needed
-            # sound=False,
-            # sound_volume=0,
+            sound_emulated=os.getenv("SOUND_EMULATED", "false").lower() == "true",
         )
         
         # Disable the boot screen to speed up initialization
@@ -105,6 +107,11 @@ class PokemonYellowEnv(gym.Env):
         
     def reset(self, seed=None) -> Tuple[np.ndarray, dict]:
         """Reset environment and return initial observation."""
+        # Clear any sticky-held inputs from a prior episode/session
+        try:
+            self._release_all_buttons()
+        except Exception:
+            self._held_buttons = set()
         # Load save state
         if self.save_state_path and os.path.exists(self.save_state_path):
             self._load_state(self.save_state_path)
@@ -122,24 +129,13 @@ class PokemonYellowEnv(gym.Env):
         self.episode_steps = 0
         self.tiles_visited = set()
         self.last_position = None
-
-        # Initialize previous-state values used for reward shaping
-        try:
-            from memory_map import decode_badge_count, decode_money, decode_party_stats, decode_in_battle, get_byte, RAM_ADDRESSES
-            self._prev_badges = decode_badge_count(obs)
-            self._prev_money = decode_money(obs)
-            self._prev_party_hp = decode_party_stats(obs)
-            self._prev_in_battle = bool(decode_in_battle(obs))
-            # Initialize opponent roster count (used for more accurate end-of-battle detection)
-            try:
-                self._prev_opponent_roster_count = get_byte(obs, RAM_ADDRESSES['OPPONENT_ROSTER_COUNT'])
-            except Exception:
-                self._prev_opponent_roster_count = 0
-            self._last_battle_result = None
-        except Exception:
-            # Keep defaults if decoders are not available or fail
-            pass
+        self._prev_in_battle_env = False
         
+        try:
+            self.reward_shaper.reset(seed=seed)
+        except Exception:
+            pass
+
         # Return observation and info dictionary (required by Gymnasium)
         return obs, {}
         
@@ -152,7 +148,59 @@ class PokemonYellowEnv(gym.Env):
         obs = self._get_observation()
         
         # Compute reward
-        reward = self._compute_reward(action)
+        # Use full WRAM (0xC000..0xDFFF) so reward code can read Cxxx flags (e.g., wBattleResult)
+        ram = self._get_wram_c000_dfff()
+        # ---- DEBUG: compare multiple candidate position decodes (Yellow offset drift) ----
+        pos_candidates = None
+        if self.debug_pos:
+            try:
+                from memory_map import decode_player_position
+                pos_candidates = decode_player_position(ram)
+            except Exception:
+                pos_candidates = None
+        info_for_reward = {'episode_steps': self.episode_steps}
+
+        # Add battle transition metadata for Option B (env computes it, reward uses it)
+        try:
+            from memory_map import decode_in_battle, decode_battle_result, decode_escaped_from_battle
+            curr_in_battle = bool(decode_in_battle(ram))
+            battle_ended = bool(self._prev_in_battle_env and (not curr_in_battle))
+
+            battle_result = -1
+            battle_result_known = False
+            if battle_ended:
+                br = int(decode_battle_result(ram))
+                if br in (0, 1, 2):
+                    battle_result = br
+                    battle_result_known = True
+
+            escaped_from_battle = bool(decode_escaped_from_battle(ram))
+
+            # Only treat as ran_away if we *know* it was draw (2) OR escaped flag set
+            ran_away = bool(
+                battle_ended and (
+                    escaped_from_battle or (battle_result_known and battle_result == 2)
+                )
+            )
+
+            info_for_reward.update({
+                'in_battle': curr_in_battle,
+                'battle_ended': battle_ended,
+                'battle_result': battle_result,
+                'battle_result_known': battle_result_known,
+                'escaped_from_battle': escaped_from_battle,
+                'ran_away': ran_away,
+            })
+
+            self._prev_in_battle_env = curr_in_battle
+
+        except Exception:
+            pass
+
+        try:
+            reward = float(self.reward_shaper.compute_reward(ram, action, info_for_reward))
+        except Exception:
+            reward = -0.001
         
         # Check if episode is done
         done = self._is_done()
@@ -162,20 +210,92 @@ class PokemonYellowEnv(gym.Env):
         
         # Update action counts for overlay
         if hasattr(self, 'action_counts'):
-            from actions import ACTIONS
-            action_name = ACTIONS[action]
-            self.action_counts[action_name] = self.action_counts.get(action_name, 0) + 1
-            self.total_actions += 1
+            try:
+                from actions import ACTIONS
+                action_name = ACTIONS.get(int(action), "UNKNOWN")
+                self.action_counts[action_name] = self.action_counts.get(action_name, 0) + 1
+                self.total_actions += 1
+            except Exception:
+                pass
         
         # Info dictionary
+        try:
+            from memory_map import decode_basic_game_info
+            basic = decode_basic_game_info(ram)
+            map_id = basic.get("map_id", 0)
+            x = basic.get("x", 0)
+            y = basic.get("y", 0)
+            in_battle = bool(basic.get("in_battle", False))
+            badges = int(basic.get("badges", 0))
+            money = int(basic.get("money", 0))
+            # If debug candidates exist, prefer them for display so you can see drift
+            if isinstance(pos_candidates, dict):
+                cur = pos_candidates.get('current', {})
+                p1 = pos_candidates.get('plus1', {})
+                m1 = pos_candidates.get('minus1', {})
+        except Exception:
+            map_id, x, y = 0, 0, 0
+            in_battle = False
+            badges = 0
+            money = 0
+            cur = {}
+            p1 = {}
+            m1 = {}
+
         info = {
             'episode_steps': self.episode_steps,
-            'tiles_visited': len(self.tiles_visited),
-            'reward': reward
+            'tiles_visited': len(getattr(self.reward_shaper, 'tiles_visited', set())),
+            'total_tiles_visited': int(getattr(self.reward_shaper, 'total_tiles_visited', 0)),
+            'battles_won': int(getattr(self.reward_shaper, 'previous_battle_wins', 0)),
+            'battles_lost': int(getattr(self.reward_shaper, 'previous_battle_losses', 0)),
+            'badges': badges,
+            'money': money,
+            'in_battle': in_battle,
+            'map_id': int(map_id),
+            'x': int(x),
+            'y': int(y),
+            'reward': float(reward),
+            # Debug: candidate positions (helps diagnose off-by-one RAM mapping)
+            'pos_cur_map_id': int(cur.get('map_id', 0)) if isinstance(pos_candidates, dict) else int(map_id),
+            'pos_cur_x': int(cur.get('x', 0)) if isinstance(pos_candidates, dict) else int(x),
+            'pos_cur_y': int(cur.get('y', 0)) if isinstance(pos_candidates, dict) else int(y),
+
+            'pos_plus1_map_id': int(p1.get('map_id', 0)) if isinstance(pos_candidates, dict) else 0,
+            'pos_plus1_x': int(p1.get('x', 0)) if isinstance(pos_candidates, dict) else 0,
+            'pos_plus1_y': int(p1.get('y', 0)) if isinstance(pos_candidates, dict) else 0,
+
+            'pos_minus1_map_id': int(m1.get('map_id', 0)) if isinstance(pos_candidates, dict) else 0,
+            'pos_minus1_x': int(m1.get('x', 0)) if isinstance(pos_candidates, dict) else 0,
+            'pos_minus1_y': int(m1.get('y', 0)) if isinstance(pos_candidates, dict) else 0,
         }
         
         # In Gymnasium, step returns (observation, reward, terminated, truncated, info)
         # For this environment, we'll set truncated=False and terminated=done
+        if self.debug_pos and (self.episode_steps % self.debug_pos_every == 0):
+            try:
+                from actions import ACTIONS
+                an = ACTIONS.get(int(action), str(action))
+            except Exception:
+                an = str(action)
+
+            if isinstance(pos_candidates, dict):
+                cur = pos_candidates.get('current', {})
+                p1 = pos_candidates.get('plus1', {})
+                m1 = pos_candidates.get('minus1', {})
+                msg = (
+                    f"[DEBUG_POS step={self.episode_steps}] action={an} "
+                    f"basic=({int(map_id)},{int(x)},{int(y)}) "
+                    f"cur=({cur.get('map_id')},{cur.get('x')},{cur.get('y')}) raw={cur.get('raw')} "
+                    f"+1=({p1.get('map_id')},{p1.get('x')},{p1.get('y')}) raw={p1.get('raw')} "
+                    f"-1=({m1.get('map_id')},{m1.get('x')},{m1.get('y')}) raw={m1.get('raw')}"
+                )
+            else:
+                msg = f"[DEBUG_POS step={self.episode_steps}] action={an} basic=({int(map_id)},{int(x)},{int(y)})"
+
+            # Avoid printing identical lines forever
+            if msg != self._debug_last_printed:
+                print(msg)
+                self._debug_last_printed = msg
         return obs, reward, done, False, info
         
     def _press_buttons(self, action: int):
@@ -241,296 +361,14 @@ class PokemonYellowEnv(gym.Env):
         self.emulator.tick()
         
     def _get_observation(self) -> np.ndarray:
-        """Get current WRAM observation from PyBoy emulator.
-
-        Pokémon Yellow relevant RAM is in the WRAM window at 0xD000..0xDFFF
-        (0x1000 bytes). `memory_map` helper functions use offsets relative to
-        0xD000, so we return a 4KB slice mapped such that index 0 corresponds
-        to address 0xD000.
-        """
+        """Return normalized observation vector."""
         if self.emulator is None:
-            return np.zeros(0x1000, dtype=np.uint8)
-            
-        # Get WRAM slice from emulator using PyBoy memory API
-        try:
-            ram = []
-            # Read the WRAM page used by Pokémon (0xD000..0xDFFF)
-            for addr in range(0xD000, 0xE000):
-                # Access memory byte by address
-                try:
-                    byte_val = self.emulator.memory[addr]
-                    masked_value = byte_val & 0xFF
-                    ram.append(masked_value)
-                except Exception as e:
-                    # If we can't read a specific address, use 0
-                    print(f"Error reading memory address {hex(addr)}: {e}")
-                    ram.append(0)
-            return np.array(ram, dtype=np.uint8)
-        except Exception as e:
-            # Fallback to zero array if memory access fails
-            print(f"Error reading WRAM: {e}")
-            return np.zeros(0x1000, dtype=np.uint8)
-        
-    def _compute_reward(self, action: int) -> float:
-        """Compute reward based on current state and action.
+            return np.zeros(43, dtype=np.float32)
 
-        Uses deltas on badges, money, and detects battle outcome transitions
-        (end-of-battle) by comparing previous and current battle/party state.
-        """
-        reward = -0.001  # Small penalty per step
-
-        # Exploration reward
-        if self._is_new_tile():
-            reward += 1.0
-
-        # Read current RAM-derived values
-        try:
-            ram_data = self._get_observation()
-            from memory_map import (
-                decode_badge_count,
-                decode_money,
-                decode_party_stats,
-                decode_in_battle,
-            )
-
-            curr_badges = decode_badge_count(ram_data)
-            curr_money = decode_money(ram_data)
-            curr_party_hp = decode_party_stats(ram_data)
-            curr_in_battle = bool(decode_in_battle(ram_data))
-            # Opponent roster count helps detect a clean end-of-battle
-            from memory_map import get_byte, RAM_ADDRESSES
-            try:
-                curr_opponent_roster = get_byte(ram_data, RAM_ADDRESSES['OPPONENT_ROSTER_COUNT'])
-            except Exception:
-                curr_opponent_roster = 0
-
-            # Badge gains are meaningful (large reward)
-            badge_delta = curr_badges - self._prev_badges
-            if badge_delta > 0:
-                reward += 50.0 * badge_delta
-
-            # If we detect a badge gain while previously in a battle, treat it as an immediate win
-            if self._prev_in_battle and badge_delta > 0:
-                reward += 10.0
-                self.battles_won = getattr(self, 'battles_won', 0) + 1
-                self._last_battle_result = 'win'
-
-            # Money gains - small reward scaled
-            money_delta = curr_money - self._prev_money
-            if money_delta > 0:
-                reward += 0.001 * money_delta
-
-            # Similarly, a money gain during a prior-battle can be treated as strong evidence of win
-            if self._prev_in_battle and money_delta > 0:
-                reward += 1.0
-                self.battles_won = getattr(self, 'battles_won', 0) + 1
-                self._last_battle_result = 'win'
-            # Battle end detection: previous in-battle -> now not in battle
-            battle_just_ended = False
-            if self._prev_in_battle and not curr_in_battle:
-                battle_just_ended = True
-            # Also consider explicit roster clearing as a strong signal
-            if getattr(self, '_prev_opponent_roster_count', 0) > 0 and curr_opponent_roster == 0:
-                battle_just_ended = True
-
-            if battle_just_ended:
-                # proceed to outcome heuristics
-
-                # Use battle type, badge/money/HP deltas, and roster info to decide outcome
-                from memory_map import decode_battle_type, decode_text_state
-
-                prev_sum = sum(self._prev_party_hp)
-                curr_sum = sum(curr_party_hp)
-
-                # Battle type may distinguish special battles; treat non-zero as valid battle
-                prev_battle_type = getattr(self, '_prev_battle_type', None)
-                if prev_battle_type is None:
-                    # Initialize from previous observation if not set
-                    try:
-                        self._prev_battle_type = decode_battle_type(self._get_observation())
-                    except Exception:
-                        self._prev_battle_type = 0
-
-                # Heuristics for win/loss with roster confirmation
-                badge_delta_during = curr_badges - self._prev_badges
-                money_delta_during = curr_money - self._prev_money
-
-                # Text state can sometimes indicate end-of-battle dialog; include as soft evidence
-                text_state_now = decode_text_state(self._get_observation())
-
-                # Prefer strong evidence: badge/money gains
-                if badge_delta_during > 0 or money_delta_during > 0:
-                    reward += 10.0
-                    self.battles_won = getattr(self, 'battles_won', 0) + 1
-                    self._last_battle_result = 'win'
-                else:
-                    # If HP dropped by more than 30% -> loss (strong signal)
-                    if prev_sum > 0 and (prev_sum - curr_sum) / max(prev_sum, 1) > 0.3:
-                        reward -= 5.0
-                        self.battles_lost = getattr(self, 'battles_lost', 0) + 1
-                        self._last_battle_result = 'loss'
-                    # If all party members fainted -> loss
-                    elif all(hp == 0.0 for hp in curr_party_hp):
-                        reward -= 5.0
-                        self.battles_lost = getattr(self, 'battles_lost', 0) + 1
-                        self._last_battle_result = 'loss'
-                    # Roster cleared and we still have enough HP -> likely a win
-                    # Use an absolute threshold on normalized HP sum to avoid
-                    # treating near-zero HP as a win when everyone nearly fainted.
-                    elif curr_opponent_roster == 0 and curr_sum > 0.2:
-                        reward += 10.0
-                        self.battles_won = getattr(self, 'battles_won', 0) + 1
-                        self._last_battle_result = 'win'
-                    else:
-                        # Otherwise treat as a minor win (uncertain)
-                        reward += 2.0
-                        self._last_battle_result = 'win'
-
-                # Update previous battle type with current observation
-                try:
-                    self._prev_battle_type = decode_battle_type(self._get_observation())
-                except Exception:
-                    self._prev_battle_type = 0
-
-            # Update previous-state trackers
-            self._prev_badges = curr_badges
-            self._prev_money = curr_money
-            self._prev_party_hp = curr_party_hp
-            self._prev_in_battle = curr_in_battle
-            # Update opponent roster tracker
-            try:
-                self._prev_opponent_roster_count = curr_opponent_roster
-            except Exception:
-                self._prev_opponent_roster_count = 0
-
-        except Exception:
-            # If RAM decoding fails, fall back to simple reward
-            pass
-
-        return reward
-        
-    def _is_new_tile(self) -> bool:
-        """Check if agent has visited a new tile by decoding position from RAM."""
-        try:
-            ram_data = self._get_observation()
-            if len(ram_data) >= 0x1000:
-                # Decode position from WRAM slice using memory map (offsets are relative to 0xD000)
-                from memory_map import decode_player_position
-                position = decode_player_position(ram_data)
-                map_id, x, y = position
-                
-                # Create tile identifier
-                tile_id = (map_id, x, y)
-                
-                # Reward for new tiles
-                if tile_id not in self.tiles_visited:
-                    self.tiles_visited.add(tile_id)
-                    return True
-                    
-            return False
-        except Exception:
-            return False
-        
-    def _is_battle_win(self) -> bool:
-        """Return True if the most-recent resolved battle was a win.
-
-        Primary check: consult the recorded `_last_battle_result` set during
-        reward computation. If unset, use a conservative fallback heuristic
-        based on RAM deltas (badges, money, party HP) when we've just
-        transitioned out of a battle.
-        """
-        # Primary recorded result
-        if self._last_battle_result == 'win':
-            return True
-        if self._last_battle_result == 'loss':
-            return False
-
-        # Fallback heuristic: only consider outcomes immediately after
-        # transitioning out of battle (previously in battle, now not) or roster clearing
-        try:
-            ram_data = self._get_observation()
-            from memory_map import decode_in_battle, decode_badge_count, decode_money, decode_party_stats, get_byte, RAM_ADDRESSES
-
-            curr_in_battle = bool(decode_in_battle(ram_data))
-            try:
-                curr_roster = get_byte(ram_data, RAM_ADDRESSES['OPPONENT_ROSTER_COUNT'])
-            except Exception:
-                curr_roster = 0
-
-            if (self._prev_in_battle and not curr_in_battle) or (self._prev_opponent_roster_count > 0 and curr_roster == 0):
-                curr_badges = decode_badge_count(ram_data)
-                curr_money = decode_money(ram_data)
-                curr_party_hp = decode_party_stats(ram_data)
-
-                prev_sum = sum(self._prev_party_hp)
-                curr_sum = sum(curr_party_hp)
-
-                # Any badge or money gain -> likely a win
-                if curr_badges > self._prev_badges or curr_money > self._prev_money:
-                    return True
-                # If roster was explicitly cleared and party retains some HP -> treat as win
-                if getattr(self, '_prev_opponent_roster_count', 0) > 0 and curr_roster == 0 and curr_sum > 0.2:
-                    return True
-                # If HP dropped by significant fraction -> likely a loss
-                if prev_sum > 0 and (prev_sum - curr_sum) / max(prev_sum, 1) > 0.3:
-                    return False
-                # If all party HP zero -> loss
-                if all(hp == 0.0 for hp in curr_party_hp):
-                    return False
-                # Roster cleared & party survived -> win (fallback)
-                if curr_roster == 0 and curr_sum > 0.2:
-                    return True
-        except Exception:
-            # Be conservative on failure
-            pass
-        return False
-        
-    def _is_battle_loss(self) -> bool:
-        """Return True if the most-recent resolved battle was a loss.
-
-        Uses `_last_battle_result` when available. If unset, falls back to a
-        conservative heuristic similar to `_is_battle_win` (HP drop >30%
-        indicates a likely loss; badge/money gain or HP improvement indicates
-        a win/avoid treating as loss).
-        """
-        if self._last_battle_result == 'loss':
-            return True
-        if self._last_battle_result == 'win':
-            return False
-
-        try:
-            ram_data = self._get_observation()
-            from memory_map import decode_in_battle, decode_badge_count, decode_money, decode_party_stats
-
-            curr_in_battle = bool(decode_in_battle(ram_data))
-            if self._prev_in_battle and not curr_in_battle:
-                curr_badges = decode_badge_count(ram_data)
-                curr_money = decode_money(ram_data)
-                curr_party_hp = decode_party_stats(ram_data)
-
-                prev_sum = sum(self._prev_party_hp)
-                curr_sum = sum(curr_party_hp)
-
-                # If badges or money increased -> not a loss (strong evidence of win)
-                if curr_badges > self._prev_badges or curr_money > self._prev_money:
-                    return False
-                # If roster was explicitly cleared and party retains some HP -> treat as win (not a loss)
-                try:
-                    from memory_map import get_byte, RAM_ADDRESSES
-                    curr_roster = get_byte(ram_data, RAM_ADDRESSES['OPPONENT_ROSTER_COUNT'])
-                except Exception:
-                    curr_roster = 0
-                if getattr(self, '_prev_opponent_roster_count', 0) > 0 and curr_roster == 0 and curr_sum > 0.2:
-                    return False
-                # If HP improved/stayed same -> not a loss
-                if curr_sum >= prev_sum:
-                    return False
-                # If HP dropped by significant fraction -> likely a loss
-                if prev_sum > 0 and (prev_sum - curr_sum) / max(prev_sum, 1) > 0.3:
-                    return True
-        except Exception:
-            pass
-        return False
+        from memory_map import get_observation_vector
+        ram = self._get_wram_c000_dfff()
+        vec = get_observation_vector(ram)
+        return np.array(vec, dtype=np.float32)
         
     def _is_done(self) -> bool:
         """Check if episode is done.
@@ -543,13 +381,17 @@ class PokemonYellowEnv(gym.Env):
             return True
 
         try:
-            ram_data = self._get_observation()
+            ram_data = self._get_wram_d000()
             if len(ram_data) >= 0x1000:
-                from memory_map import decode_party_stats
-                party_hp = decode_party_stats(ram_data)
-                # Consider episode done if all party members have 0 HP
-                if all(hp == 0.0 for hp in party_hp):
-                    return True
+                from memory_map import decode_party_stats, get_party_count
+                party_count = int(get_party_count(ram_data))
+
+                # Brand-new games can have an empty party (count == 0). That should NOT be terminal.
+                if party_count > 0:
+                    party_hp = decode_party_stats(ram_data)[:party_count]
+                    # Consider episode done only if all existing party members have 0 HP
+                    if all(hp <= 0.0 for hp in party_hp):
+                        return True
         except Exception:
             pass
 
@@ -577,8 +419,101 @@ class PokemonYellowEnv(gym.Env):
         # In headless mode, no rendering needed
         pass
         
+    def _release_all_buttons(self) -> None:
+        """Release any currently held buttons (sticky input cleanup)."""
+        if self.emulator is None:
+            self._held_buttons = set()
+            return
+
+        try:
+            from pyboy.utils import WindowEvent
+        except Exception:
+            self._held_buttons = set()
+            return
+
+        button_release_map = {
+            'UP': WindowEvent.RELEASE_ARROW_UP,
+            'DOWN': WindowEvent.RELEASE_ARROW_DOWN,
+            'LEFT': WindowEvent.RELEASE_ARROW_LEFT,
+            'RIGHT': WindowEvent.RELEASE_ARROW_RIGHT,
+            'A': WindowEvent.RELEASE_BUTTON_A,
+            'B': WindowEvent.RELEASE_BUTTON_B,
+            'SELECT': WindowEvent.RELEASE_BUTTON_SELECT,
+            'START': WindowEvent.RELEASE_BUTTON_START,
+        }
+
+        for b in list(getattr(self, '_held_buttons', set())):
+            rel = button_release_map.get(b)
+            if rel is not None:
+                try:
+                    self.emulator.send_input(rel)
+                except Exception:
+                    pass
+
+        self._held_buttons = set()
+
     def close(self):
         """Close the emulator."""
         if self.emulator:
+            try:
+                self._release_all_buttons()
+            except Exception:
+                pass
             self.emulator.stop()
             self.emulator = None
+
+    def _get_wram_d000(self) -> bytes:
+        """Return a 0x1000-byte slice of WRAM (0xD000..0xDFFF) as bytes."""
+        if self.emulator is None:
+            return b"\x00" * 0x1000
+
+        mem = self.emulator.memory
+        base = 0xD000
+        buf = bytearray(0x1000)
+        for i in range(0x1000):
+            buf[i] = int(mem[base + i]) & 0xFF
+        return bytes(buf)
+
+    def _get_wram_c000_dfff(self) -> bytes:
+        """Return a 0x2000-byte slice of WRAM (0xC000..0xDFFF) as bytes.
+
+        This includes Cxxx battle result flags like `wBattleResult` (0xCF0B).
+        """
+        if self.emulator is None:
+            return b"\x00" * 0x2000
+
+        mem = self.emulator.memory
+        base = 0xC000
+        buf = bytearray(0x2000)
+        for i in range(0x2000):
+            buf[i] = int(mem[base + i]) & 0xFF
+        return bytes(buf)
+
+    # ---- Hybrid (Option C) tuning hooks for SB3 callbacks ----
+    def set_phase(self, phase: int) -> None:
+        """Manually set the reward phase for this env instance."""
+        try:
+            rs = getattr(self, 'reward_shaper', None)
+            if rs is not None and hasattr(rs, 'set_phase'):
+                rs.set_phase(int(phase))
+        except Exception:
+            pass
+
+    def get_phase(self) -> int:
+        """Return current reward phase."""
+        try:
+            rs = getattr(self, 'reward_shaper', None)
+            if rs is not None and hasattr(rs, 'get_phase'):
+                return int(rs.get_phase())
+        except Exception:
+            pass
+        return 1
+
+    def set_reward_multipliers(self, multipliers: dict) -> None:
+        """Update per-component reward multipliers (exploration, stuck, etc.)."""
+        try:
+            rs = getattr(self, 'reward_shaper', None)
+            if rs is not None and hasattr(rs, 'set_dynamic_multipliers'):
+                rs.set_dynamic_multipliers(multipliers)
+        except Exception:
+            pass
